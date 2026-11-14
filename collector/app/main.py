@@ -53,6 +53,8 @@ async def get_records() -> dict:
     return {
         "round_id": state["round_id"],
         "status": state["status"],
+        "deliverable": state["deliverable"],
+        "revision_verified": state["revision_verified"],
         "count": len(crawler.records()),
         "records": crawler.records(),
     }
@@ -66,6 +68,20 @@ async def download_records():
     payload = {
         "round_id": state["round_id"],
         "status": state["status"],
+        # Round revision verification verdict. False while a round is still
+        # running, after a stop, with unfinished pages, or on any revision
+        # mismatch / missing marker.
+        "deliverable": state["deliverable"],
+        "revision_verification": {
+            "deliverable": state["deliverable"],
+            "verified_revision": state["revision_verified"],
+            "reason": state["revision_reason"],
+            "observed_pages": state["revisions_observed"],
+            "conflict_pages": state["revision_conflicts"],
+            "observed_revision_count": len(
+                {o["revision"] for o in state["revisions_observed"] if o["revision"]}
+            ),
+        },
         "base_url": state["base_url"],
         "started_at": state["started_at"],
         "finished_at": state["finished_at"],

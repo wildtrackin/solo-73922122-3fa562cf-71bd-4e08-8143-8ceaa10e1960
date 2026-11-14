@@ -37,6 +37,17 @@
     .badge.stopped { background: #b91c1c; }
     .badge.completed { background: #047857; }
     .badge.partial { background: #a16207; }
+    .badge.deliverable-yes { background: #059669; color: #ecfdf5; }
+    .badge.deliverable-no { background: #991b1b; color: #fee2e2; }
+    .badge.deliverable-pending { background: #475569; color: #e2e8f0; }
+    .verdict-box { border-radius: 10px; padding: 16px 18px; border: 1px solid var(--line);
+                   background: #0b1220; }
+    .verdict-box.ok { border-color: #059669; background: #022c22; }
+    .verdict-box.bad { border-color: #b91c1c; background: #2a0a0a; }
+    .verdict-box.pending { border-color: #475569; }
+    .verdict-box h3 { margin: 0 0 8px; font-size: 15px; }
+    .verdict-box .reason { color: var(--muted); font-size: 13px; line-height: 1.6; }
+    .verdict-box .rev { font-family: ui-monospace, monospace; color: var(--green); font-weight: 700; }
     .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
     .stat { background: #0b1220; border: 1px solid var(--line); border-radius: 8px;
             padding: 12px 14px; }
@@ -66,7 +77,10 @@
 <body>
   <header>
     <h1>📋 公共采购公告采集台</h1>
-    <span id="statusBadge" class="badge idle">空闲 idle</span>
+    <span style="display:flex;gap:10px;align-items:center">
+      <span id="deliverableBadge" class="badge deliverable-pending">可交付：核验未开始</span>
+      <span id="statusBadge" class="badge idle">空闲 idle</span>
+    </span>
   </header>
   <main>
     <section class="panel">
@@ -101,6 +115,29 @@
     </section>
 
     <section class="panel">
+      <h2>轮次修订核验（整轮结束、全部页面成功且修订号齐全一致才标记可交付）</h2>
+      <div id="verdictBox" class="verdict-box pending">
+        <h3 id="verdictTitle">核验尚未开始</h3>
+        <div class="reason" id="verdictReason">启动一轮采集后，将在整轮结束时给出可交付结论；采集中不会显示可交付。</div>
+        <p style="margin:10px 0 0;font-size:13px">
+          确认修订号：<span id="verifiedRevision" class="rev">—</span>
+          ｜ 已观测页面：<span id="observedCount">0</span>
+          ｜ 不同修订号数量：<span id="distinctCount">0</span>
+        </p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>修订冲突页（混修订或缺修订号的页面均列明页面与修订号；存在任一冲突则整轮不可交付）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>栏目</th><th>类型</th><th>页/编号</th><th>页面修订号</th><th>冲突类型</th><th>URL</th></tr></thead>
+          <tbody id="conflictBody"><tr><td colspan="6" class="muted">暂无冲突</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
       <h2>分栏目进度</h2>
       <div class="section-grid" id="sections"></div>
     </section>
@@ -119,8 +156,8 @@
       <h2>已提取公告</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>公告编号</th><th>标题</th><th>采购单位</th><th>截止日期</th><th>来源栏目</th></tr></thead>
-          <tbody id="recordsBody"><tr><td colspan="5" class="muted">暂无数据</td></tr></tbody>
+          <thead><tr><th>公告编号</th><th>标题</th><th>采购单位</th><th>截止日期</th><th>来源栏目</th><th>页面修订号</th></tr></thead>
+          <tbody id="recordsBody"><tr><td colspan="6" class="muted">暂无数据</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -176,17 +213,61 @@
          <td><a href="${r.url}" target="_blank" rel="noopener">链接</a></td></tr>`).join("");
     }
 
+    function renderVerification(s) {
+      const badge = $("deliverableBadge");
+      const box = $("verdictBox");
+      const busy = s.status === "running" || s.status === "stopping" || s.status === "idle";
+      if (busy) {
+        badge.textContent = "可交付：核验进行中（采集中不可交付）";
+        badge.className = "badge deliverable-pending";
+        box.className = "verdict-box pending";
+        $("verdictTitle").textContent = s.status === "idle" ? "核验尚未开始" : "核验进行中…";
+      } else if (s.deliverable) {
+        badge.textContent = "✅ 可交付 deliverable";
+        badge.className = "badge deliverable-yes";
+        box.className = "verdict-box ok";
+        $("verdictTitle").textContent = "核验通过：本轮结果可交付";
+      } else {
+        badge.textContent = "⛔ 不可交付 not deliverable";
+        badge.className = "badge deliverable-no";
+        box.className = "verdict-box bad";
+        $("verdictTitle").textContent = "核验未通过：本轮结果不可交付";
+      }
+      $("verdictReason").textContent = s.revision_reason || "";
+      $("verifiedRevision").textContent = s.revision_verified || "—";
+      $("observedCount").textContent = (s.revisions_observed || []).length;
+      const distinct = new Set((s.revisions_observed || [])
+        .map(o => o.revision).filter(v => v));
+      $("distinctCount").textContent = distinct.size;
+
+      const conflicts = s.revision_conflicts || [];
+      const cbody = $("conflictBody");
+      if (!conflicts.length) {
+        cbody.innerHTML = '<tr><td colspan="6" class="muted">暂无冲突</td></tr>';
+        return;
+      }
+      const typeLabel = (t) => t === "revision_missing"
+        ? "页面缺少修订号" : "修订号与其他页面不一致";
+      cbody.innerHTML = conflicts.map(c =>
+        `<tr class="warn"><td>${c.section}</td><td>${c.page_type}</td><td>${c.page}</td>
+         <td>${c.revision === null ? '<em>（无修订号）</em>' : c.revision}</td>
+         <td>${typeLabel(c.conflict_type)}</td>
+         <td><a href="${c.url}" target="_blank" rel="noopener">链接</a></td></tr>`).join("");
+    }
+
     async function loadRecords() {
       const resp = await fetch("/api/records");
       const data = await resp.json();
       const body = $("recordsBody");
       if (!data.records.length) {
-        body.innerHTML = '<tr><td colspan="5" class="muted">暂无数据</td></tr>';
+        body.innerHTML = '<tr><td colspan="6" class="muted">暂无数据</td></tr>';
         return;
       }
       body.innerHTML = data.records.map(r =>
         `<tr><td>${r.announcement_code}</td><td>${escapeHtml(r.title)}</td>
-         <td>${escapeHtml(r.procurement_unit)}</td><td>${r.deadline}</td><td>${r.section}</td></tr>`).join("");
+         <td>${escapeHtml(r.procurement_unit)}</td><td>${r.deadline}</td><td>${r.section}</td>
+         <td>${r.page_revision === null || r.page_revision === undefined
+            ? '<em class="muted">无</em>' : r.page_revision}</td></tr>`).join("");
       $("records").textContent = data.count;
     }
 
@@ -210,6 +291,7 @@
       $("finishedAt").textContent = s.finished_at ? s.finished_at.replace("T", " ").slice(0, 19) : "—";
       renderSections(s.sections);
       renderUnfinished(s.unfinished);
+      renderVerification(s);
       $("events").innerHTML = s.events.slice().reverse().map(e =>
         `<div class="${e.includes("429") || e.includes("unfinished") || e.includes("error") ? "warn" : ""}">${escapeHtml(e)}</div>`).join("");
       await loadRecords();

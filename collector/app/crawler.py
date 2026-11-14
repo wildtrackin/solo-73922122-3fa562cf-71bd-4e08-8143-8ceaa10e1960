@@ -16,6 +16,22 @@ Concurrency and rate-limit contract:
   requests and the connection pool, and only then flips the state to stopped
   and permits a new round. A round id guards against a late response from the
   old round being written into the new one.
+
+Round revision verification (deliverability):
+
+* Every successfully parsed list/detail page contributes the site revision it
+  displayed. The observations are collected regardless of the order in which
+  parallel workers happen to finish, so scheduling and 429 cooldowns cannot
+  change the verdict.
+* At round end, and only then, the round is marked ``deliverable`` when *all*
+  of the following hold: every enqueued page finished successfully (no
+  unfinished pages, no stop), every page carried a revision marker, and every
+  observed revision is the same single value.
+* A page arriving with a different revision (including a late republished page
+  near the end of the round) is listed with its page identity and revision in
+  ``revision_conflicts`` and keeps the whole round undeliverable.
+* During the run (and after a stop) ``deliverable`` stays false; starting a new
+  round rebuilds every container, so no old-round verdict can carry over.
 """
 
 from __future__ import annotations
@@ -64,6 +80,29 @@ class UnfinishedPage:
 
 
 @dataclass
+class RevisionObservation:
+    """One successfully parsed page and the revision marker it displayed."""
+
+    section: str
+    page_type: str  # "list" | "detail"
+    page: str
+    url: str
+    revision: str | None
+
+
+@dataclass
+class RevisionConflict:
+    """A page that breaks the single-revision requirement for the round."""
+
+    section: str
+    page_type: str
+    page: str
+    url: str
+    revision: str | None  # None means the page carried no revision marker
+    conflict_type: str  # "revision_mismatch" | "revision_missing"
+
+
+@dataclass
 class RoundState:
     round_id: str | None = None
     status: str = "idle"  # idle | running | stopping | stopped | completed | partial
@@ -79,6 +118,13 @@ class RoundState:
     sections: dict[str, SectionProgress] = field(default_factory=dict)
     unfinished: list[UnfinishedPage] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
+    # ---- round revision verification ----
+    # Never true while a round is running; set exactly once, at round end.
+    deliverable: bool = False
+    revision_verified: str | None = None
+    revision_reason: str = "核验尚未开始：轮次结束后才会给出可交付结论"
+    revisions_observed: list[RevisionObservation] = field(default_factory=list)
+    revision_conflicts: list[RevisionConflict] = field(default_factory=list)
 
 
 class Crawler:
@@ -112,6 +158,10 @@ class Crawler:
         now = time.monotonic()
         remaining = max(0.0, self._cooldown_until - now)
         self.state.cooldown_remaining_seconds = round(remaining, 1)
+        # Deliverability is only decided at round end; while the round is
+        # active nobody may read a stale "true" from a previous round.
+        if self.state.status in ("running", "stopping", "idle"):
+            self.state.deliverable = False
         return asdict(self.state)
 
     def records(self) -> list[dict]:
@@ -136,12 +186,16 @@ class Crawler:
             self._records: dict[str, dict] = {}
             self._seen_codes: set[str] = set()
 
+            # A brand-new state object: no revision verdict, conflict list or
+            # observation from any previous round can leak into this one.
             self.state = RoundState(
                 round_id=round_id,
                 status="running",
                 base_url=self.base_url,
                 started_at=datetime.now(timezone.utc).isoformat(),
                 sections={name: SectionProgress() for name in self.sections},
+                deliverable=False,
+                revision_reason="核验进行中：整轮结束、全部页面成功且修订号齐全一致后才可交付",
             )
             # Limits created before this round do not apply to the new one:
             # a fresh client also guarantees a fresh connection pool.
@@ -165,6 +219,7 @@ class Crawler:
             self._stop_event.set()
             self.state.stop_requested = True
             self.state.status = "stopping"
+            self.state.deliverable = False
             self._log("stop requested: queued/cooling requests will not be sent")
 
             # Close in-flight requests and release the connection pool. The
@@ -253,9 +308,105 @@ class Crawler:
         else:
             self.state.status = "completed"
         self.state.records_count = len(self._records)
+        # Revision verification is the last step of the round and is the only
+        # place that may flip deliverable to True.
+        self._verify_revisions()
         self._log(
             f"round ended: status={self.state.status}, "
-            f"records={self.state.records_count}, unfinished={len(self.state.unfinished)}"
+            f"deliverable={self.state.deliverable}, "
+            f"records={self.state.records_count}, unfinished={len(self.state.unfinished)}, "
+            f"revision_conflicts={len(self.state.revision_conflicts)}"
+        )
+
+    def _verify_revisions(self) -> None:
+        """Decide deliverability from the whole round's observations.
+
+        The verdict depends only on the collected observations, never on which
+        worker finished first, so parallel response ordering and 429 cooldowns
+        cannot change it.
+        """
+        observations = self.state.revisions_observed
+        conflicts: list[RevisionConflict] = []
+
+        if self._stop_event.is_set():
+            self.state.deliverable = False
+            self.state.revision_verified = None
+            self.state.revision_reason = "轮次被停止：未完整遍历全部页面，不可交付"
+            self.state.revision_conflicts = conflicts
+            return
+
+        if self.state.unfinished:
+            self.state.deliverable = False
+            self.state.revision_verified = None
+            self.state.revision_reason = (
+                f"存在 {len(self.state.unfinished)} 个未完成页面：全部页面成功是可交付前提，"
+                "本轮不可交付"
+            )
+            self.state.revision_conflicts = conflicts
+            return
+
+        if not observations:
+            self.state.deliverable = False
+            self.state.revision_verified = None
+            self.state.revision_reason = "未采集到任何页面修订号，无法核验，不可交付"
+            self.state.revision_conflicts = conflicts
+            return
+
+        missing = [obs for obs in observations if not obs.revision]
+        for obs in missing:
+            conflicts.append(
+                RevisionConflict(
+                    section=obs.section,
+                    page_type=obs.page_type,
+                    page=obs.page,
+                    url=obs.url,
+                    revision=None,
+                    conflict_type="revision_missing",
+                )
+            )
+
+        present = [obs for obs in observations if obs.revision]
+        present_values = sorted({obs.revision for obs in present})
+        if len(present_values) > 1:
+            baseline = present_values[0]
+            for obs in present:
+                if obs.revision != baseline:
+                    conflicts.append(
+                        RevisionConflict(
+                            section=obs.section,
+                            page_type=obs.page_type,
+                            page=obs.page,
+                            url=obs.url,
+                            revision=obs.revision,
+                            conflict_type="revision_mismatch",
+                        )
+                    )
+
+        self.state.revision_conflicts = conflicts
+
+        if missing:
+            self.state.deliverable = False
+            self.state.revision_verified = None
+            self.state.revision_reason = (
+                f"{len(missing)} 个页面未标注修订号（修订号不齐全），即使其余页面一致也不可交付"
+            )
+            return
+
+        if len(present_values) > 1:
+            self.state.deliverable = False
+            self.state.revision_verified = None
+            joined = " / ".join(present_values)
+            self.state.revision_reason = (
+                f"同一轮混入 {len(present_values)} 个修订号（{joined}）："
+                f"冲突页面 {len(conflicts)} 个，均已列明页面与修订号，本轮不可交付"
+            )
+            return
+
+        single = present_values[0]
+        self.state.deliverable = True
+        self.state.revision_verified = single
+        self.state.revision_reason = (
+            f"全部 {len(observations)} 个页面成功且修订号齐全一致（{single}），本轮可交付"
         )
 
     async def _worker(
@@ -305,6 +456,7 @@ class Crawler:
 
         progress.list_completed += 1
         self.state.pages_completed += 1
+        self._record_revision(job, result.revision)
 
         spawned = 0
         if job["page"] == 1:
@@ -359,6 +511,7 @@ class Crawler:
 
         progress.detail_completed += 1
         self.state.pages_completed += 1
+        self._record_revision(job, detail.get("revision"))
         self._records[detail["code"]] = {
             "announcement_code": detail["code"],
             "title": detail["title"],
@@ -366,9 +519,34 @@ class Crawler:
             "deadline": detail["deadline"],
             "section": section,
             "detail_url": self._absolute(job["url"]),
+            "page_revision": detail.get("revision"),
         }
         self.state.records_count = len(self._records)
         pending["count"] -= 1
+
+    def _record_revision(self, job: dict, revision: str | None) -> None:
+        """Append one page-level revision observation.
+
+        Append order mirrors completion order, but the final verification only
+        uses set equality over the observations, so the order is irrelevant.
+        """
+        self.state.revisions_observed.append(
+            RevisionObservation(
+                section=job["section"],
+                page_type=job["kind"],
+                page=str(job["page"]),
+                url=self._absolute(job["url"]),
+                revision=revision,
+            )
+        )
+        if revision is None:
+            self._log(
+                f"[{job['section']}] {job['kind']} page {job['page']} carries no revision marker"
+            )
+        else:
+            self._log(
+                f"[{job['section']}] {job['kind']} page {job['page']} revision={revision}"
+            )
 
     # ------------------------------------------------------------- transport
     async def _get_parsed_page(self, round_id: str, job: dict, parse_func):

@@ -1,4 +1,8 @@
-"""Deterministic in-memory dataset for the mock procurement site."""
+"""Deterministic in-memory dataset for the mock procurement site.
+
+The base dataset is immutable; runtime edits made on the admin page are kept as
+per-code overrides in :mod:`app.main` and merged through :func:`effective_row`.
+"""
 
 import random
 from dataclasses import dataclass
@@ -63,13 +67,29 @@ def _build() -> dict[tuple[str, str], Announcement]:
 ANNOUNCEMENTS: dict[tuple[str, str], Announcement] = _build()
 
 
-def section_rows(section: str) -> list[Announcement]:
-    return [a for key, a in ANNOUNCEMENTS.items() if key[0] == section]
+def section_rows(section: str, overrides: dict[str, Announcement] | None = None) -> list[Announcement]:
+    overrides = overrides or {}
+    rows = []
+    for key, item in ANNOUNCEMENTS.items():
+        if key[0] != section:
+            continue
+        rows.append(overrides.get(item.code, item))
+    return rows
 
 
-def find_by_code(code: str) -> Announcement | None:
+def find_by_code(code: str, overrides: dict[str, Announcement] | None = None) -> Announcement | None:
     # Detail pages are shared by code across the two columns.
+    overrides = overrides or {}
     for item in ANNOUNCEMENTS.values():
         if item.code == code:
-            return item
+            return overrides.get(code, item)
     return None
+
+
+def all_codes() -> list[str]:
+    """Unique announcement codes in a stable order (for the admin edit form)."""
+    seen: list[str] = []
+    for item in ANNOUNCEMENTS.values():
+        if item.code not in seen:
+            seen.append(item.code)
+    return seen
